@@ -14,14 +14,10 @@ def is_chinese_char(t):
 
 def extract_words():
     all_units = []
-    unit_num = 1
-    unit_words = []
-    words_per_unit = 50  # 每50个词一个单元
+    # PDF 每页是一个独立单元（每页序号从1开始，共100页，每页12词）
 
     with pdfplumber.open(pdf_path) as pdf:
-        global_idx = 0  # 全局词序号
-
-        for page in pdf.pages:
+        for page_num, page in enumerate(pdf.pages, 1):
             chars = page.chars
             # 过滤水印 (size > 15)
             text_chars = [c for c in chars if c['size'] < 15]
@@ -139,27 +135,18 @@ def extract_words():
                 if not word:
                     continue
 
-                global_idx += 1
+                # 添加到当前页的单元（每页一个单元）
+                if not all_units or all_units[-1]['unit'] != page_num:
+                    all_units.append({'unit': page_num, 'words': []})
 
-                # 添加到单元
-                unit_words.append({
-                    'idx': len(unit_words) + 1,
+                all_units[-1]['words'].append({
+                    'idx': len(all_units[-1]['words']) + 1,
                     'word': word,
                     'source': source,
                     'pos': pos,
                     'cn': cn,
                     'example': example
                 })
-
-                # 每50个词一个单元
-                if len(unit_words) >= words_per_unit:
-                    all_units.append({'unit': unit_num, 'words': unit_words})
-                    unit_num += 1
-                    unit_words = []
-
-    # 添加剩余的词
-    if unit_words:
-        all_units.append({'unit': unit_num, 'words': unit_words})
 
     return all_units
 
