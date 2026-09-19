@@ -62,12 +62,14 @@ body::before{
 .brand{
   display:flex;align-items:baseline;gap:10px;
   cursor:pointer;user-select:none;
+  flex:0 0 auto;min-width:0;   /* 不参与收缩，否则窄屏下被挤成竖排 */
 }
 .brand-mark{
   font-family:'Noto Serif KR',serif;
   font-weight:900;font-size:24px;
   color:var(--coral);
   letter-spacing:-.02em;
+  white-space:nowrap;          /* 韩文可在字间断行，必须禁止 */
 }
 .brand-sub{
   font-family:'Cormorant Garamond',serif;
@@ -425,6 +427,17 @@ body::before{
 .word-cn{
   font-size:14px;color:var(--ink-soft);
   text-align:right;
+}
+/* 全等级搜索结果的范围提示与来源徽标 */
+.search-scope{
+  grid-column:1/-1;
+  font-size:13px;color:var(--ink-soft);
+  margin-bottom:4px;
+}
+.word-badge{
+  font-size:11px;color:var(--ink-soft);
+  border:1px solid var(--line-soft);border-radius:999px;
+  padding:1px 8px;white-space:nowrap;align-self:flex-start;
 }
 .word-ex{
   width:100%;font-size:12px;color:var(--ink-soft);
@@ -953,7 +966,7 @@ body::before{
 /* Responsive */
 @media (max-width:768px){
   .topbar-inner{padding:14px 20px;gap:12px}
-  .nav-links{gap:0}
+  .nav-links{gap:0;flex-wrap:wrap;justify-content:center}
   .nav-link{padding:6px 10px;font-size:13px}
   .brand-sub{display:none}
   .view{padding:32px 20px 60px}
@@ -984,6 +997,8 @@ body::before{
 }
 @media (max-width:480px){
   .nav-links{flex-wrap:wrap;justify-content:center}
+  .brand-mark{font-size:20px}
+  .nav-link{padding:6px 8px;font-size:12.5px}
   .hero-stats{flex-direction:column;gap:16px;align-items:flex-start}
   .mode-grid{grid-template-columns:1fr}
   .stats-grid{grid-template-columns:1fr}
@@ -1223,15 +1238,35 @@ const LEVELS = [
   {id:'beginner', name:'初级', kr:'초급', desc:'550个初级核心词汇', units:WORD_DATA},
   {id:'advanced', name:'中高级', kr:'중고급', desc:'1200个中高级词汇，100个单元', units:ADVANCED_DATA}
 ];
+const ALL_UNITS = 0;   // 「全部」哨兵值
+
 let currentLevel = 'beginner';
-function getCurrentLevel(){return LEVELS.find(l=>l.id===currentLevel) || LEVELS[0]}
-function getCurrentUnits(){return getCurrentLevel().units}
-function setLevel(id){
-  currentLevel = id;
-  currentUnit = getCurrentUnits().length ? getCurrentUnits()[0].unit : 0;
-  state.lastUnit = currentUnit;
+
+// 注意：必须是函数声明（不是 const 箭头函数）——loadState() 在脚本解析期就会调用它，
+// 箭头函数形式会因 TDZ 抛错导致整页白屏。
+function getLevel(id){ return LEVELS.find(l => l.id === id) || null }
+function getCurrentLevel(){ return getLevel(currentLevel) || LEVELS[0] }
+function getCurrentUnits(){ return getCurrentLevel().units }
+
+function isValidUnit(levelId, unitNum){
+  if(unitNum === ALL_UNITS) return true;
+  const lv = getLevel(levelId);
+  return !!lv && lv.units.some(u => u.unit === unitNum);
+}
+function rememberUnit(levelId, unitNum){
+  state.lastUnitByLevel[levelId] = unitNum;
+  state.lastUnit = unitNum;      // 兼容仍读旧字段的缓存页面
+}
+// 单元越界时收敛到当前等级的第一个单元；「全部」(0) 是合法值，不收敛
+function normalizeCurrentUnit(){
+  if(currentUnit === ALL_UNITS) return;
+  const units = getCurrentUnits();
+  if(units.some(u => u.unit === currentUnit)) return;
+  currentUnit = units.length ? units[0].unit : ALL_UNITS;
+  rememberUnit(currentLevel, currentUnit);
   saveState();
-  // 根据当前视图重新渲染对应页面
+}
+function renderCurrentView(){
   if(currentView === 'home') renderHome();
   else if(currentView === 'list') renderList();
   else if(currentView === 'quiz') renderQuiz();
@@ -1240,10 +1275,27 @@ function setLevel(id){
   else if(currentView === 'stats') renderStats();
   else if(currentView === 'grammar') renderGrammar();
   else if(currentView === 'idiom') renderIdiom();
+  else if(currentView === 'exam') renderExam();
+}
+function setLevel(id){
+  if(!getLevel(id)) return;
+  currentLevel = id;
+  state.level = id;
+  const units = getCurrentUnits();
+  const remembered = state.lastUnitByLevel[id];
+  currentUnit = units.some(u => u.unit === remembered)
+    ? remembered                                          // 恢复该等级上次所在单元
+    : (units.length ? units[0].unit : ALL_UNITS);
+  rememberUnit(id, currentUnit);
+  saveState();
+  renderCurrentView();
 }
 
 // ===== STATE =====
 const STORAGE_KEY = 'kr_vocab_progress_v1';
+const BACKUP_KEY  = 'kr_vocab_progress_v1_backup';   // 迁移前的一次性原始备份，供人工回滚
+const SCHEMA_VERSION = 2;
+
 let state = loadState();
 let currentView = 'home';
 let currentUnit = 1;
@@ -1251,49 +1303,135 @@ let quizState = null;
 let flashState = null;
 let writeState = null;
 
+function emptyState(){
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    learned:{}, mastered:{},
+    quizStats:{correct:0, total:0},
+    writeStats:{correct:0, total:0},
+    level:'beginner',
+    lastUnit:1,
+    lastUnitByLevel:{}          // {beginner:3, advanced:50}
+  };
+}
+
+// v1 → v2：进度键 'unit_idx' 不带等级，两个等级同号单元会互相覆盖。
+// 新版键为 '<level>:<unit>_<idx>'。旧键归属：
+//   unit > 初级单元数  → 只可能来自中高级，确定归属
+//   unit <= 初级单元数 → 有歧义，保守归到初级（旧版 UI 里这些键本就显示在初级卡片上）
+function migrateV1(s){
+  const beginnerUnits = getLevel('beginner') ? getLevel('beginner').units.length : 11;
+  const learned = {}, mastered = {};
+  const move = (src, dst) => {
+    Object.keys(src || {}).forEach(k => {
+      if(k.indexOf(':') >= 0){ dst[k] = true; return; }   // 已是 v2 键
+      const m = /^(\d+)_(\d+)$/.exec(k);
+      if(!m) return;                                       // 无法识别，丢弃
+      const unit = parseInt(m[1], 10), idx = parseInt(m[2], 10);
+      const lv = unit > beginnerUnits ? 'advanced' : 'beginner';
+      dst[lv + ':' + unit + '_' + idx] = true;
+    });
+  };
+  move(s.learned, learned);
+  move(s.mastered, mastered);
+  Object.keys(mastered).forEach(k => { learned[k] = true; });   // 维持 mastered ⊆ learned
+  return {learned, mastered};
+}
+
 function loadState(){
   try{
-    const s = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-    return {
-      learned: s.learned || {},      // {unitIdx_wordIdx: true}
-      mastered: s.mastered || {},    // {unitIdx_wordIdx: true}
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return emptyState();
+    const s = JSON.parse(raw) || {};
+
+    if(s.schemaVersion === SCHEMA_VERSION){
+      return {
+        schemaVersion: SCHEMA_VERSION,
+        learned: s.learned || {},
+        mastered: s.mastered || {},
+        quizStats: s.quizStats || {correct:0, total:0},
+        // 拼写统计：兼容更早版本的 spellStats 键
+        writeStats: s.writeStats || s.spellStats || {correct:0, total:0},
+        level: getLevel(s.level) ? s.level : 'beginner',
+        lastUnit: s.lastUnit || 1,
+        lastUnitByLevel: (s.lastUnitByLevel && typeof s.lastUnitByLevel === 'object') ? s.lastUnitByLevel : {}
+      };
+    }
+
+    // ---------- v1 → v2 一次性迁移 ----------
+    const migrated = migrateV1(s);
+    const beginnerUnits = getLevel('beginner') ? getLevel('beginner').units.length : 11;
+    const legacyUnit = parseInt(s.lastUnit, 10) || 1;
+    // lastUnit 越出初级范围 ⇒ 用户当时在中高级，顺带修复旧版「等级回退到初级」的遗留
+    const legacyLevel = legacyUnit > beginnerUnits ? 'advanced' : 'beginner';
+    const st = {
+      schemaVersion: SCHEMA_VERSION,
+      learned: migrated.learned,
+      mastered: migrated.mastered,
       quizStats: s.quizStats || {correct:0, total:0},
-      // 拼写统计：兼容旧版 spellStats / writeStats 两个键
       writeStats: s.writeStats || s.spellStats || {correct:0, total:0},
-      lastUnit: s.lastUnit || 1
+      level: legacyLevel,
+      lastUnit: legacyUnit,
+      lastUnitByLevel: legacyUnit === 1 && legacyLevel === 'beginner'
+        ? {}
+        : {[legacyLevel]: legacyUnit}
     };
+    // 写回必须用局部变量且单独 try：
+    //   1) 此处 state 尚未赋值完成，调用 saveState() 会把 "undefined" 写进 localStorage
+    //   2) 外层 catch 是「返回空白 state」，配额/无痕模式异常会顺手清掉用户进度
+    try{
+      if(!localStorage.getItem(BACKUP_KEY)) localStorage.setItem(BACKUP_KEY, raw);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+    }catch(e){ /* 写盘失败不影响本次会话 */ }
+    return st;
   }catch(e){
-    return {learned:{}, mastered:{}, quizStats:{correct:0,total:0}, writeStats:{correct:0,total:0}, lastUnit:1};
+    return emptyState();
   }
 }
 function saveState(){
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
-function wordKey(unit, idx){return unit+'_'+idx}
-function markLearned(unit, idx){
-  state.learned[wordKey(unit, idx)] = true;
-  saveState();
-}
-function markMastered(unit, idx){
-  state.mastered[wordKey(unit, idx)] = true;
-  state.learned[wordKey(unit, idx)] = true;
-  saveState();
-}
-function isLearned(unit, idx){return !!state.learned[wordKey(unit, idx)]}
-function isMastered(unit, idx){return !!state.mastered[wordKey(unit, idx)]}
 
-function getUnit(unitNum){
-  const units = getCurrentUnits();
-  return units.find(u => u.unit === unitNum) || units[0];
+// 进度键：'<level>:<unit>_<idx>'，例如 'beginner:1_5' / 'advanced:50_3'
+function wordKey(level, unit, idx){ return level + ':' + unit + '_' + idx }
+function markLearned(level, unit, idx){
+  state.learned[wordKey(level, unit, idx)] = true;
+  saveState();
 }
-function getAllWords(){
+function markMastered(level, unit, idx){
+  const k = wordKey(level, unit, idx);
+  state.mastered[k] = true;
+  state.learned[k] = true;      // 维持 mastered ⊆ learned
+  saveState();
+}
+function isLearned(level, unit, idx){ return !!state.learned[wordKey(level, unit, idx)] }
+function isMastered(level, unit, idx){ return !!state.mastered[wordKey(level, unit, idx)] }
+
+// 物化词条时统一带上 unit 与 level，调用方据此读写进度，
+// 不再依赖全局 currentUnit/currentLevel（那正是进度写错单元的根因）。
+function getUnit(unitNum, levelId){
+  const lv = getLevel(levelId || currentLevel);
+  return lv ? (lv.units.find(u => u.unit === unitNum) || null) : null;   // 找不到返回 null，不回退
+}
+function getAllWords(levelId){
+  const lv = getLevel(levelId || currentLevel);
+  if(!lv) return [];
   const all = [];
-  getCurrentUnits().forEach(u => u.words.forEach(w => all.push({...w, unit:u.unit})));
+  lv.units.forEach(u => u.words.forEach(w => all.push({...w, unit:u.unit, level:lv.id})));
   return all;
 }
-function getUnitWords(unitNum){
-  if(unitNum === 0) return getAllWords();
-  return getUnit(unitNum).words.map(w => ({...w, unit:unitNum}));
+function getAllWordsAllLevels(){
+  const all = [];
+  LEVELS.forEach(l => all.push(...getAllWords(l.id)));
+  return all;
+}
+function getUnitWords(unitNum, levelId){
+  const lv = getLevel(levelId || currentLevel);
+  if(!lv) return [];
+  if(unitNum === ALL_UNITS) return getAllWords(lv.id);
+  const unit = lv.units.find(u => u.unit === unitNum);
+  if(!unit) return [];                                          // 单元不存在 → 空列表
+  return unit.words.map(w => ({...w, unit:unit.unit, level:lv.id}));
 }
 
 // ===== NAVIGATION =====
@@ -1305,16 +1443,7 @@ function go(view){
     l.classList.toggle('active', l.dataset.nav === view);
   });
   window.scrollTo({top:0, behavior:'smooth'});
-  
-  if(view === 'home') renderHome();
-  else if(view === 'list') renderList();
-  else if(view === 'quiz') renderQuiz();
-  else if(view === 'flash') renderFlash();
-  else if(view === 'write') renderWrite();
-  else if(view === 'stats') renderStats();
-  else if(view === 'grammar') renderGrammar();
-  else if(view === 'idiom') renderIdiom();
-  else if(view === 'exam') renderExam();
+  renderCurrentView();
 }
 
 // ===== TOAST =====
@@ -1328,16 +1457,16 @@ function toast(msg){
 
 // ===== HOME =====
 function renderHome(){
-  // Stats - 汇总所有等级
-  const learnedCount = Object.keys(state.learned).length;
-  const masteredCount = Object.keys(state.mastered).length;
+  // 首页跨等级汇总：分子分母取自同一张词表（全部等级），保证自洽
+  const allWords = getAllWordsAllLevels();
+  const learnedCount = allWords.filter(w => isLearned(w.level, w.unit, w.idx)).length;
+  const masteredCount = allWords.filter(w => isMastered(w.level, w.unit, w.idx)).length;
   document.getElementById('homeLearned').textContent = learnedCount;
   document.getElementById('homeMastered').textContent = masteredCount;
   const acc = state.quizStats.total > 0 ? Math.round(state.quizStats.correct/state.quizStats.total*100)+'%' : '—';
   document.getElementById('homeAccuracy').textContent = acc;
 
-  // 汇总总词数
-  const totalWords = LEVELS.reduce((s,l)=>s+l.units.reduce((a,u)=>a+u.words.length,0),0);
+  const totalWords = allWords.length;
   document.getElementById('homeTotalWords').textContent = totalWords;
   const eyebrow = document.querySelector('.hero-eyebrow');
   if(eyebrow) eyebrow.textContent = `한국어 단어 · ${totalWords}个词汇`;
@@ -1366,8 +1495,8 @@ function renderHome(){
       <span style="font-size:13px;color:var(--ink-soft);font-family:'Cormorant Garamond',serif;font-style:italic">${l.units.length} units · ${lvlWordCount} words</span>
     </div>`;
     l.units.forEach(u => {
-      const learned = u.words.filter(w => isLearned(u.unit, w.idx)).length;
-      const mastered = u.words.filter(w => isMastered(u.unit, w.idx)).length;
+      const learned = u.words.filter(w => isLearned(l.id, u.unit, w.idx)).length;
+      const mastered = u.words.filter(w => isMastered(l.id, u.unit, w.idx)).length;
       const pct = u.words.length ? (mastered/u.words.length*100) : 0;
       html += `
         <div class="unit-card" onclick="selectUnitForLearn(${u.unit}, '${l.id}')">
@@ -1388,9 +1517,10 @@ function renderHome(){
   grid.innerHTML = html || `<div style="grid-column:1/-1;text-align:center;padding:48px;color:var(--ink-soft)">暂无词汇</div>`;
 }
 function selectUnitForLearn(unit, level){
-  if(level) currentLevel = level;
+  if(level && getLevel(level)){ currentLevel = level; state.level = level; }
+  if(!isValidUnit(currentLevel, unit)) return;
   currentUnit = unit;
-  state.lastUnit = unit;
+  rememberUnit(currentLevel, unit);
   saveState();
   go('quiz');
 }
@@ -1413,7 +1543,7 @@ function renderUnitSelector(containerId, includeAll=false){
   const c = document.getElementById(containerId);
   let html = '';
   if(includeAll){
-    html += `<button class="unit-pill ${currentUnit===0?'active':''}" onclick="setUnit(0)">全部</button>`;
+    html += `<button class="unit-pill ${currentUnit===ALL_UNITS?'active':''}" onclick="setUnit(${ALL_UNITS})">全部</button>`;
   }
   html += getCurrentUnits().map(u =>
     `<button class="unit-pill ${currentUnit===u.unit?'active':''}" onclick="setUnit(${u.unit})">第${u.unit}单元</button>`
@@ -1421,8 +1551,11 @@ function renderUnitSelector(containerId, includeAll=false){
   c.innerHTML = html;
 }
 function setUnit(u){
+  if(!isValidUnit(currentLevel, u)) return;      // 非法单元直接忽略，不写进 state
+  const si = document.getElementById('searchInput');
+  if(si && si.value) si.value = '';              // 点单元 = 明确的「浏览该单元」意图，退出搜索态
   currentUnit = u;
-  state.lastUnit = u;
+  rememberUnit(currentLevel, u);
   saveState();
   if(currentView === 'list') renderList();
   else if(currentView === 'quiz') renderQuiz();
@@ -1436,30 +1569,40 @@ function renderList(){
   renderLevelTabs('listLevelTabs');
   renderUnitSelector('listUnitSelector', true);
   const search = document.getElementById('searchInput').value.trim().toLowerCase();
-  let words = getUnitWords(currentUnit);
+  const list = document.getElementById('wordList');
+
+  // 搜索是「帮我找到这个词」的全局意图，与单元 pill 的「浏览这一批」是两种模态，
+  // 因此搜索态下忽略等级/单元筛选；非搜索态保持原来的单元浏览行为。
+  let words, note = '';
   if(search){
-    words = words.filter(w => 
-      w.word.toLowerCase().includes(search) || 
+    words = getAllWordsAllLevels().filter(w =>
+      w.word.toLowerCase().includes(search) ||
       w.cn.toLowerCase().includes(search)
     );
+    note = `<div class="search-scope">在全部等级中搜索到 ${words.length} 条（已忽略单元筛选）</div>`;
+  }else{
+    normalizeCurrentUnit();
+    words = getUnitWords(currentUnit);
   }
-  const list = document.getElementById('wordList');
+
   if(words.length === 0){
-    list.innerHTML = `<div class="empty" style="grid-column:1/-1"><div class="empty-icon">🔍</div><div class="empty-text">没有找到匹配的单词</div></div>`;
+    list.innerHTML = `<div class="empty" style="grid-column:1/-1"><div class="empty-icon">🔍</div><div class="empty-text">${search ? '全部等级中都没有找到匹配的单词' : '没有找到匹配的单词'}</div></div>`;
     return;
   }
-  list.innerHTML = words.map(w => {
-    const learned = isLearned(w.unit, w.idx);
-    const mastered = isMastered(w.unit, w.idx);
+  list.innerHTML = note + words.map(w => {
+    const learned = isLearned(w.level, w.unit, w.idx);
+    const mastered = isMastered(w.level, w.unit, w.idx);
     const cls = mastered ? 'mastered' : (learned ? 'learned' : '');
     const meta = [w.pos, w.source].filter(Boolean).join(' ');
     const ex = w.example ? `<div class="word-ex">${w.example}</div>` : '';
+    const badge = search ? `<span class="word-badge">${getLevel(w.level).name} · 第${w.unit}单元</span>` : '';
     return `
       <div class="word-item ${learned?'learned':''}" onclick="speakWord('${w.word}')">
         <span class="word-num">${String(w.idx).padStart(2,'0')}</span>
         <div class="word-main">
           <span class="word-kr">${w.word}</span>
           ${meta ? `<span class="word-meta">${meta}</span>` : ''}
+          ${badge}
           <span class="word-cn">${w.cn}</span>
           ${ex}
         </div>
@@ -1471,6 +1614,7 @@ function renderList(){
 
 // ===== QUIZ (Multiple Choice) =====
 function renderQuiz(){
+  normalizeCurrentUnit();
   renderLevelTabs('quizLevelTabs');
   renderUnitSelector('quizUnitSelector');
   const words = getUnitWords(currentUnit);
@@ -1558,22 +1702,25 @@ function answerQuiz(btn){
   opts.forEach(o => o.classList.add('disabled'));
   const fb = document.getElementById('quizFeedback');
   const isCorrect = picked === correct;
+  // 用题目词条自身的 unit/level 记账，与 currentUnit 无关 ——
+  // 「全部」模式下 currentUnit 为 0，旧写法会把成绩写到第 1 单元
+  const w = quizState.words[quizState.current];
 
   opts.forEach(o => {
     if(o.dataset.word === correct) o.classList.add('correct');
     else if(o.dataset.word === picked && !isCorrect) o.classList.add('wrong');
   });
-  
+
   if(isCorrect){
     quizState.correct++;
     state.quizStats.correct++;
     fb.className = 'quiz-feedback show correct';
     fb.innerHTML = '✅ 回答正确！';
-    markLearned(getUnit(currentUnit).unit, quizState.words[quizState.current].idx);
+    markLearned(w.level, w.unit, w.idx);
   }else{
     fb.className = 'quiz-feedback show wrong';
-    fb.innerHTML = `❌ 答错了。正确释义：${quizState.words[quizState.current].cn}`;
-    insertRetry(quizState.words, quizState.current, quizState.words[quizState.current]);
+    fb.innerHTML = `❌ 答错了。正确释义：${w.cn}`;
+    insertRetry(quizState.words, quizState.current, w);
   }
   state.quizStats.total++;
   saveState();
@@ -1613,6 +1760,7 @@ function renderQuizResult(){
 
 // ===== FLASHCARD =====
 function renderFlash(){
+  normalizeCurrentUnit();
   renderLevelTabs('flashLevelTabs');
   renderUnitSelector('flashUnitSelector');
   const words = getUnitWords(currentUnit);
@@ -1634,9 +1782,9 @@ function renderFlashcard(){
   const w = flashState.words[flashState.current];
   const total = flashState.words.length;
   const cur = flashState.current + 1;
-  const learned = isLearned(w.unit, w.idx);
-  const mastered = isMastered(w.unit, w.idx);
-  
+  const learned = isLearned(w.level, w.unit, w.idx);
+  const mastered = isMastered(w.level, w.unit, w.idx);
+
   c.innerHTML = `
     <div class="flashcard-stage">
       <div class="flashcard" id="flashcard" onclick="flipFlash()">
@@ -1695,19 +1843,21 @@ function prevFlash(){
 }
 function toggleFlashLearned(){
   const w = flashState.words[flashState.current];
-  if(isLearned(w.unit, w.idx)){
-    delete state.learned[wordKey(w.unit, w.idx)];
+  if(isLearned(w.level, w.unit, w.idx)){
+    delete state.learned[wordKey(w.level, w.unit, w.idx)];
+    saveState();          // 原来漏了：取消标记不落盘会丢
   }else{
-    markLearned(w.unit, w.idx);
+    markLearned(w.level, w.unit, w.idx);
   }
   renderFlashcard();
 }
 function toggleFlashMastered(){
   const w = flashState.words[flashState.current];
-  if(isMastered(w.unit, w.idx)){
-    delete state.mastered[wordKey(w.unit, w.idx)];
+  if(isMastered(w.level, w.unit, w.idx)){
+    delete state.mastered[wordKey(w.level, w.unit, w.idx)];
+    saveState();          // 同上
   }else{
-    markMastered(w.unit, w.idx);
+    markMastered(w.level, w.unit, w.idx);
     toast('⭐ 已标记为掌握');
   }
   renderFlashcard();
@@ -1721,6 +1871,7 @@ function shuffleFlash(){
 
 // ===== SPELLING (拼写：看中文默写韩文) =====
 function renderWrite(){
+  normalizeCurrentUnit();
   renderLevelTabs('writeLevelTabs');
   renderUnitSelector('writeUnitSelector');
   const words = getUnitWords(currentUnit);
@@ -1799,7 +1950,7 @@ function checkWrite(){
     input.classList.add('correct');
     writeState.correct++;
     state.writeStats.correct++;
-    markLearned(w.unit, w.idx);
+    markLearned(w.level, w.unit, w.idx);
     toast('✅ 拼写正确！');
   }else{
     input.classList.add('wrong');
@@ -1833,7 +1984,7 @@ function nextWrite(){
 function markWriteLearned(){
   const w = writeState && writeState.words[writeState.current];
   if(!w) return;
-  markMastered(w.unit, w.idx);
+  markMastered(w.level, w.unit, w.idx);
   toast('⭐ 已标记为掌握');
 }
 
@@ -1865,17 +2016,23 @@ function renderWriteResult(){
 function renderStats(){
   renderLevelTabs('statsLevelTabs');
   const c = document.getElementById('statsContent');
-  const learnedCount = Object.keys(state.learned).length;
-  const masteredCount = Object.keys(state.mastered).length;
-  const totalWords = getAllWords().length;
+  const lv = getCurrentLevel();
+
+  // 分子与分母必须同源：都限定在当前等级的同一张词表。
+  // 枚举词表 + 查表（而不是数 key 前缀）能保证 learnedCount <= totalWords，
+  // 且「各单元进度」之和 == 顶部大数字，用户可自行核对。
+  const levelWords = getAllWords(lv.id);
+  const totalWords = levelWords.length;
+  const learnedCount = levelWords.filter(w => isLearned(w.level, w.unit, w.idx)).length;
+  const masteredCount = levelWords.filter(w => isMastered(w.level, w.unit, w.idx)).length;
   const quizAcc = state.quizStats.total > 0 ? Math.round(state.quizStats.correct/state.quizStats.total*100) : 0;
   const spellAcc = state.writeStats.total > 0 ? Math.round(state.writeStats.correct/state.writeStats.total*100) : 0;
   const learnedPct = totalWords ? Math.round(learnedCount/totalWords*100) : 0;
   const masteredPct = totalWords ? Math.round(masteredCount/totalWords*100) : 0;
-  
+
   let unitRows = getCurrentUnits().map(u => {
-    const learned = u.words.filter(w => isLearned(u.unit, w.idx)).length;
-    const mastered = u.words.filter(w => isMastered(u.unit, w.idx)).length;
+    const learned = u.words.filter(w => isLearned(lv.id, u.unit, w.idx)).length;
+    const mastered = u.words.filter(w => isMastered(lv.id, u.unit, w.idx)).length;
     const pct = u.words.length ? (mastered/u.words.length*100) : 0;
     return `
       <div class="unit-progress-row">
@@ -1893,12 +2050,12 @@ function renderStats(){
       <div class="stat-card">
         <div class="stat-card-label">已学习</div>
         <div class="stat-card-value">${learnedCount}</div>
-        <div class="stat-card-sub">${learnedPct}% · 共${totalWords}词</div>
+        <div class="stat-card-sub">${learnedPct}% · ${lv.name}共${totalWords}词</div>
       </div>
       <div class="stat-card sage">
         <div class="stat-card-label">已掌握</div>
         <div class="stat-card-value">${masteredCount}</div>
-        <div class="stat-card-sub">${masteredPct}% · 共${totalWords}词</div>
+        <div class="stat-card-sub">${masteredPct}% · ${lv.name}共${totalWords}词</div>
       </div>
       <div class="stat-card gold">
         <div class="stat-card-label">选词义正确率</div>
@@ -1914,7 +2071,7 @@ function renderStats(){
     <div class="section-head">
       <div>
         <div class="section-title">各单元进度 <span class="kr">단원별 진도</span></div>
-        <div class="section-meta">各单元掌握情况</div>
+        <div class="section-meta">${lv.name} · 各单元掌握情况</div>
       </div>
     </div>
     <div class="unit-progress-list">
@@ -1925,7 +2082,10 @@ function renderStats(){
 
 function resetProgress(){
   if(!confirm('确定要重置所有学习进度吗？此操作不可撤销。')) return;
-  state = {learned:{}, mastered:{}, quizStats:{correct:0,total:0}, writeStats:{correct:0,total:0}, lastUnit:1};
+  state = emptyState();
+  state.level = currentLevel;      // 重置进度 ≠ 跳回初级
+  currentUnit = getCurrentUnits().length ? getCurrentUnits()[0].unit : ALL_UNITS;
+  rememberUnit(currentLevel, currentUnit);
   saveState();
   toast('进度已重置');
   renderStats();
@@ -1978,12 +2138,39 @@ document.addEventListener('keydown', e => {
 });
 
 // ===== INIT =====
-currentUnit = state.lastUnit || 1;
+// 恢复上次的等级与单元。等级必须一起恢复，否则中高级第 50 单元刷新后会落到
+// 初级（只有 11 个单元）上，单元越界后进度会写错地方。
+currentLevel = getLevel(state.level) ? state.level : 'beginner';
+(function initUnit(){
+  const units = getCurrentUnits();
+  const remembered = state.lastUnitByLevel[currentLevel];
+  currentUnit = units.some(u => u.unit === remembered)
+    ? remembered
+    : (units.length ? units[0].unit : ALL_UNITS);
+  rememberUnit(currentLevel, currentUnit);
+})();
+saveState();    // 首次访问也落盘一次，写入 level / lastUnitByLevel
+
 document.getElementById('searchInput').addEventListener('input', () => {
   clearTimeout(listSearchTimeout);
   listSearchTimeout = setTimeout(renderList, 200);
 });
 renderHome();
+
+// 自动化测试用的只读调试入口（不参与任何功能逻辑）
+window.__app = {
+  get state(){return state},
+  get currentLevel(){return currentLevel},
+  get currentView(){return currentView},
+  get currentUnit(){return currentUnit},
+  get quizState(){return quizState},
+  get flashState(){return flashState},
+  get writeState(){return writeState},
+  getUnitWords:(u,l)=>getUnitWords(u,l),
+  getAllWords:(l)=>getAllWords(l),
+  getAllWordsAllLevels:()=>getAllWordsAllLevels(),
+  wordKey:(l,u,i)=>wordKey(l,u,i)
+};
 
 
 // ===== GRAMMAR QUIZ =====
@@ -2075,7 +2262,7 @@ function renderGrammarQuestions(){
         <div class="quiz-word" style="font-size:22px;line-height:1.6">${q.question}</div>
       </div>
       <div class="options-grid" id="grammarOptions">
-        ${shuffle([...q.options]).map((opt, i) => `
+        ${shuffle(normalizeOptions(q.options, q.answer)).map((opt, i) => `
           <button class="option-btn" data-idx="${i}" data-answer="${escapeHtml(q.answer)}" data-opt="${escapeHtml(opt)}" onclick="answerGrammar(this)">
             ${opt}
           </button>
@@ -2093,6 +2280,21 @@ function renderGrammarQuestions(){
 function escapeHtml(text){
   if(text === null || text === undefined) return '';
   return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+// 选项去重。数据源里存在重复项（如 中高级语法2 第4单元的「用于消极情况」），
+// 会渲染出两个一模一样的按钮。判分走 data-opt 字符串比对，删掉非正确项的
+// 重复副本不影响判定；末尾兜底保证正确项一定在列表里。
+function normalizeOptions(options, answer){
+  const seen = new Set(), out = [];
+  (options || []).forEach(o => {
+    if(o === null || o === undefined || o === '') return;
+    if(seen.has(o)) return;
+    seen.add(o);
+    out.push(o);
+  });
+  if(answer !== null && answer !== undefined && out.indexOf(answer) < 0) out.push(answer);
+  return out;
 }
 
 function answerGrammar(btn){
