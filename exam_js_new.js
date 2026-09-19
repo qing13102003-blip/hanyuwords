@@ -176,13 +176,7 @@ function answerExam(btn){
     fb.innerHTML = `❌ 答错了。正确释义：${correct}`;
     const key = examState.questions[examState.current].word;
     examState.mistakeMap[key] = (examState.mistakeMap[key] || 0) + 1;
-    if(examState.mistakeMap[key] <= 2){
-      const q = examState.questions[examState.current];
-      for(let r = 0; r < 3; r++){
-        const insertPos = examState.current + 1 + Math.floor(Math.random() * 3);
-        examState.questions.splice(insertPos, 0, q);
-      }
-    }
+    insertRetry(examState.questions, examState.current, examState.questions[examState.current]);
   }
   examState.answered = true;
   document.getElementById('examNextBtn').disabled = false;
@@ -235,7 +229,9 @@ function renderExamWrite(){
     examWriteState = {
       unit: currentExamUnit,
       words: shuffle([...words]),
-      current: 0
+      current: 0,
+      correct: 0,
+      answered: false
     };
   }
   renderExamWriteQuestion();
@@ -244,6 +240,10 @@ function renderExamWrite(){
 function renderExamWriteQuestion(){
   const c = document.getElementById('examContent');
   if(!examWriteState){ renderExamWrite(); return; }
+  if(examWriteState.current >= examWriteState.words.length){
+    showExamWriteResult();
+    return;
+  }
   const w = examWriteState.words[examWriteState.current];
   const total = examWriteState.words.length;
   const cur = examWriteState.current + 1;
@@ -252,6 +252,7 @@ function renderExamWriteQuestion(){
     <div class="spell-stage" style="max-width:640px;margin:0 auto">
       <div class="quiz-progress" style="max-width:640px;margin:0 auto 24px">
         <div class="progress-count">${cur} / ${total}</div>
+        <div class="progress-count">正确 ${examWriteState.correct}</div>
       </div>
       <div class="spell-card">
         <div class="spell-hint">请根据中文释义拼写对应的韩文单词</div>
@@ -261,7 +262,7 @@ function renderExamWriteQuestion(){
         <input type="text" class="spell-input" id="exWriteInput"
           placeholder="在此输入韩文..."
           autocomplete="off" autocapitalize="off" spellcheck="false"
-          onkeydown="if(event.key==='Enter'){event.preventDefault(); checkExWrite();}">
+          onkeydown="if(event.key==='Enter'){event.preventDefault(); examWriteState.answered ? nextExamWrite() : checkExWrite();}">
         <button class="btn btn-primary" onclick="checkExWrite()">提交</button>
       </div>
       <div style="text-align:center;margin-bottom:16px">
@@ -273,10 +274,9 @@ function renderExamWriteQuestion(){
         <div class="spell-reveal-word">${w.word}</div>
       </div>
       <div class="quiz-feedback" id="exWriteFeedback"></div>
-      <div style="text-align:center;margin-top:24px;display:flex;gap:10px;justify-content:center">
-        <button class="btn btn-ghost" onclick="prevExamWrite()">← 上一个</button>
-        <button class="btn btn-ghost" onclick="nextExamWrite()">下一个 →</button>
+      <div style="text-align:center;margin-top:24px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
         <button class="btn btn-ghost" onclick="go('home')">退出</button>
+        <button class="btn btn-primary" id="exWriteNextBtn" style="display:none" onclick="nextExamWrite()">下一个 → <span style="font-size:11px;opacity:.7">(Enter)</span></button>
       </div>
     </div>
   `;
@@ -284,6 +284,7 @@ function renderExamWriteQuestion(){
 }
 
 function checkExWrite(){
+  if(!examWriteState || examWriteState.answered) return;
   const input = document.getElementById('exWriteInput');
   if(!input) return;
   const val = input.value.trim();
@@ -291,8 +292,11 @@ function checkExWrite(){
   const w = examWriteState.words[examWriteState.current];
   const fb = document.getElementById('exWriteFeedback');
   const isCorrect = val === w.word || val.replace(/\s/g,'') === w.word;
+  examWriteState.answered = true;
+
   if(isCorrect){
     input.classList.add('correct');
+    examWriteState.correct++;
     fb.className = 'quiz-feedback show correct';
     fb.innerHTML = '✅ 写对了！';
     toast('✅ 正确！');
@@ -302,21 +306,50 @@ function checkExWrite(){
     fb.className = 'quiz-feedback show wrong';
     fb.innerHTML = '❌ 还差一点，看看正确答案吧';
     toast('❌ 再想想');
+    insertRetry(examWriteState.words, examWriteState.current, w);
   }
+  document.getElementById('exWriteNextBtn').style.display = 'inline-block';
+  input.focus();
 }
 
 function revealExAnswer(){
-  document.getElementById('exWriteReveal').classList.add('show');
+  const reveal = document.getElementById('exWriteReveal');
+  if(reveal) reveal.classList.add('show');
+  if(examWriteState && !examWriteState.answered){
+    examWriteState.answered = true;
+    const btn = document.getElementById('exWriteNextBtn');
+    if(btn) btn.style.display = 'inline-block';
+  }
+  document.getElementById('exWriteInput')?.focus();
 }
 
 function nextExamWrite(){
-  examWriteState.current = (examWriteState.current + 1) % examWriteState.words.length;
+  examWriteState.current++;
+  examWriteState.answered = false;
   renderExamWriteQuestion();
 }
 
-function prevExamWrite(){
-  examWriteState.current = (examWriteState.current - 1 + examWriteState.words.length) % examWriteState.words.length;
-  renderExamWriteQuestion();
+function showExamWriteResult(){
+  const container = document.getElementById('examContent');
+  const total = examWriteState.words.length;
+  const correct = examWriteState.correct;
+  const pct = total ? Math.round(correct / total * 100) : 0;
+  container.innerHTML = `
+    <div class="quiz-result">
+      <div class="quiz-result-score">${correct}/${total}</div>
+      <div class="quiz-result-title">本单元完成！</div>
+      <div class="quiz-result-desc">正确率 ${pct}%</div>
+      <div class="quiz-actions" style="justify-content:center;margin-top:24px">
+        <button class="btn btn-ghost" onclick="go('home')">返回首页</button>
+        <button class="btn btn-primary" onclick="restartExamWriteUnit()">再来一遍</button>
+      </div>
+    </div>
+  `;
+}
+
+function restartExamWriteUnit(){
+  examWriteState = null;
+  renderExamWrite();
 }
 
 // 全局键盘监听：真题选词义 Enter 下一题
